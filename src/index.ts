@@ -766,6 +766,7 @@ export function apply(ctx: Context): void {
     name: 'restart_harness',
     description:
       '重启整个 DeepSeek Harness 进程，用于重新加载插件与配置（profile 的 cordis 组合、settings 等）。'
+      + '**无必填参数**：直接调用（传空对象）即按推荐默认执行，无需先想传什么。'
       + '默认 waitForTurnEnd=true：本工具立即返回，真正的重启排在本轮回复送达之后，'
       + '因此不会掐断本轮、也不需要你停手；轮后新到的用户消息留在持久 inbox，重启后继续处理。'
       + '重启完成后自动注入「请继续之前未完成的工作」恢复会话。'
