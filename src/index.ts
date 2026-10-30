@@ -43,6 +43,28 @@ import { superviseRestartHelper } from './restart-helper-lifecycle.js'
 export const name = 'dsh-restart'
 export const inject = ['tools', 'commands', 'agents', 'shell', 'sandboxPolicy']
 
+/**
+ * Auto-continue 注入消息的持久来源。
+ *
+ * 按官方规范: `MessageSourceMap` 是可合并扩展的联合类型, 每个生产者声明自己的 kind,
+ * **没有统一的 catch-all `plugin` kind**。所以这里声明本插件专属的 kind 并 augment 进映射表,
+ * 而不是往既有 kind 里塞 `plugin:${name}` 这种字符串。
+ *
+ * `form: 'instructions'` —— 注入的内容是让模型照做的指令。
+ */
+export interface RestartContinuationSource {
+  readonly kind: 'plugin:dsh-restart'
+  /** 注入文本取自本插件的 `continuePrompt` 配置。 */
+  readonly form: 'instructions'
+}
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    /** 重启完成后由本插件注入的「继续之前未完成的工作」消息。 */
+    'plugin:dsh-restart': RestartContinuationSource
+  }
+}
+
 /** Plugin configuration (editable via settings.yaml and, later, the UI card). */
 interface RestartConfig {
   legacyRestart: boolean
@@ -59,7 +81,7 @@ interface RestartConfig {
   watchdogPollMs: number
 }
 
-const RestartConfigSchema: z<RestartConfig> = z.object({
+const RestartConfigSchema = z.object({
   legacyRestart: z.boolean().default(false),
   continuePrompt: z.string().default('（系统已重启完成）请继续之前未完成的工作。'),
   resumeWaitMs: z.number().default(1800000),
@@ -73,7 +95,7 @@ const RestartConfigSchema: z<RestartConfig> = z.object({
  * dsh 0.1.7+ : 宿主从插件导出的 Config schema 派生「插件配置」表单(旧 installSection 已移除)。
  * 本地补丁:导出 Config 供宿主投影表单,命名空间即本插件的 profile entry id「dsh-restart」。
  */
-export const Config: z<RestartConfig> = RestartConfigSchema
+export const Config = RestartConfigSchema
 
 const DEFAULT_CONFIG: RestartConfig = {
   legacyRestart: false,
@@ -236,7 +258,7 @@ function tryAutoContinue(ctx: Context, dynamic: () => RestartConfig): void {
     try {
       ;(agent as { followup: (message: unknown) => unknown }).followup(createUserMessage({
         content: [{ type: 'text', text: configOf().continuePrompt }],
-        source: { kind: `plugin:${name}`, form: 'instructions' },
+        source: { kind: 'plugin:dsh-restart', form: 'instructions' },
       }))
     } catch (error) {
       console.error('[dsh-restart] auto-continue failed:', error)
@@ -677,7 +699,9 @@ export function apply(ctx: Context): void {
   const dynamic = (): RestartConfig => resolveConfig()
   try {
     ctx.inject(['settings'], (settingsCtx) => {
-      settingsCtx.settings.installSection(ctx, 'dsh-restart', RestartConfigSchema, DEFAULT_CONFIG, {
+      // TS 5.9 对 schemastery 3.18.2 的 z.object() 推断出 Schema<ObjectS, ObjectT> (S≠T),
+      // 与 installSection 的 z<T> 不兼容; 运行时无差异, 用断言收敛到声明类型。
+      settingsCtx.settings.installSection(ctx, 'dsh-restart', RestartConfigSchema as unknown as z<RestartConfig>, DEFAULT_CONFIG, {
         setSource: (get) => { resolveConfig = get },
         onChange: () => {},
       })
@@ -810,7 +834,15 @@ export function apply(ctx: Context): void {
       } else {
         result = restart(2000)
       }
-      const r = result as { ok?: boolean; pid?: number; delayMs?: number; logOut?: string; error?: string }
+      const r = result as {
+        ok?: boolean
+        pid?: number
+        delayMs?: number
+        logOut?: string
+        error?: string
+        via?: 'launchd' | 'native'
+        launchdLabel?: string
+      }
       if (r.ok === false) {
         return { kind: 'error', text: r.error ?? '重启失败' }
       }
