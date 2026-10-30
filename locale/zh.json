@@ -1,0 +1,10 @@
+{
+  "meta": {
+    "title": "DSH 重启",
+    "description": "重启 DSH 进程以重新加载插件与配置(本机补丁版:表单作用域改用 configForms)"
+  },
+  "restart": {
+    "title": "立即重启",
+    "description": "安排一次 DSH 进程重启,等待新进程就绪后自动刷新页面"
+  }
+}

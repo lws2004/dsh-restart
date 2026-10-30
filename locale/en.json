@@ -1,0 +1,10 @@
+{
+  "meta": {
+    "title": "DSH Restart",
+    "description": "Restart the DSH process to reload plugins and configuration (locally patched: settings scope now resolved via configForms)"
+  },
+  "restart": {
+    "title": "Restart now",
+    "description": "Schedule a DSH process restart, then refresh the page once the new process is ready"
+  }
+}
