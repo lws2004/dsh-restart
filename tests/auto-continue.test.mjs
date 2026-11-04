@@ -65,3 +65,59 @@ test('auto-continue keeps the recovery marker when followup throws', async () =>
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
+
+test('auto-continue unwraps volatile config references before delivery', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-restart-volatile-'))
+  const marker = path.join(root, 'dsh-resume.json')
+  const previousHome = process.env.DSH_HOME
+  const cleanups = []
+  const originalConsoleError = console.error
+
+  process.env.DSH_HOME = root
+  fs.writeFileSync(marker, JSON.stringify({ sessionIds: ['session-v'] }), 'utf8')
+  console.error = () => {}
+
+  const delivered = []
+  // 宿主解析 .volatile() 字段后给出的是 { get() } 引用对象，而非裸值。
+  const config = {
+    legacyRestart: { get: () => false },
+    continuePrompt: { get: () => 'volatile-continue' },
+    watchdogEnabled: false,
+    watchdogCooldownMs: 60_000,
+    watchdogPollMs: 1_000,
+  }
+  const ctx = {
+    agents: {
+      get(sessionId) {
+        if (sessionId !== 'session-v') return undefined
+        return { followup(message) { delivered.push(message) } }
+      },
+    },
+    commands: { register() {} },
+    on() { return () => {} },
+    get() { return undefined },
+    effect(register) {
+      const cleanup = register()
+      if (typeof cleanup === 'function') cleanups.push(cleanup)
+    },
+    inject() {},
+    sandboxPolicy: { resolve() { return undefined } },
+    shell: {},
+    tools: { register() {} },
+  }
+
+  try {
+    apply(ctx, config)
+    await wait(650)
+    assert.equal(delivered.length, 1)
+    // 只有解包成裸字符串，createUserMessage 的 structuredClone 才不会抛 DataCloneError。
+    assert.equal(delivered[0].content[0].text, 'volatile-continue')
+    assert.equal(fs.existsSync(marker), false)
+  } finally {
+    for (const cleanup of cleanups) cleanup()
+    console.error = originalConsoleError
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})

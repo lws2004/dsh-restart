@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { SettingsForm, SettingsValueField, Switch } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { SettingsCardProps } from './index.ts'
 import { restartAndWait } from './restart-monitor.ts'
 import { styles as css } from './styles.ts'
@@ -19,11 +20,16 @@ function rememberRestartSucceeded(): void {
   try { sessionStorage.setItem(RESTART_SUCCEEDED_KEY, '1') } catch { /* reload still works */ }
 }
 
-/** The dsh-restart configuration card, styled with the host plugin-card tokens. */
+/**
+ * The dsh-restart configuration page: the restart method, the continue prompt,
+ * and the immediate restart control. The Plugins page draws the title and
+ * one-liner itself; this component renders only what the page asks for.
+ * @param props - the view asked for, locale copy, the form snapshot, and its actions.
+ * @returns the one-liner, or the settings form.
+ */
 export function SettingsCard(props: SettingsCardProps) {
-  const { t, set, clear } = props
+  const { t } = props
   const state = props.useDshRestart(snapshot => snapshot)
-  const [open, setOpen] = useState(false)
   const [restarting, setRestarting] = useState(false)
   const [restartFailed, setRestartFailed] = useState(false)
   const [restartStale, setRestartStale] = useState(false)
@@ -37,13 +43,9 @@ export function SettingsCard(props: SettingsCardProps) {
     return () => { window.clearTimeout(timer) }
   }, [restartSucceeded])
 
-  if (!state.available) return null
-  const disabled = !state.writable
+  if (props.view === 'summary') return t('description')
+  const disabled = !state.writable || state.saving
 
-  const text = (field: string, value: string): void => {
-    if (value.trim() === '') clear(field)
-    else set(field, value.trim())
-  }
   const restartNow = async (): Promise<void> => {
     if (restarting) return
     setRestarting(true)
@@ -74,51 +76,52 @@ export function SettingsCard(props: SettingsCardProps) {
   }
 
   return (
-    <li className={`${css.card} ${open ? css.cardOpen : ''}`}>
-      <button
-        type="button"
-        className={css.header}
-        aria-expanded={open}
-        aria-label={`${t(open ? 'collapse' : 'expand')}: ${t('title')}`}
-        onClick={() => { setOpen(!open) }}
-      >
-        <span className={css.headText}>
-          <span className={css.name}>{t('title')}</span>
-          <span className={css.description}>{t('description')}</span>
-        </span>
-        <svg className={`${css.chevron} ${open ? css.chevronOpen : ''}`} viewBox="0 0 14 14" width="14" height="14" aria-hidden="true">
-          <path d="M3.5 5.5 7 9l3.5-3.5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-        </svg>
-      </button>
-
-      {open ? (
-        <div className={css.body}>
-          {!state.writable ? <p className={css.readOnly} role="status">{t('readOnly')}</p> : null}
-
-          <label className={css.toggleField}>
-            <input className={css.checkbox} type="checkbox" checked={state.legacyRestart} disabled={disabled} onChange={event => { set('legacyRestart', event.currentTarget.checked) }} />
-            <span className={css.toggleCopy}>
-              <span className={css.label}>{t('legacyRestart')}</span>
-              <span className={css.hint}>{t('legacyRestartHint')}</span>
-            </span>
-          </label>
-
-          <label className={css.field} htmlFor="dsh-restart-continue-prompt">
-            <span className={css.label}>{t('continuePrompt')}</span>
-            <input id="dsh-restart-continue-prompt" className={css.input} type="text" value={state.continuePrompt} disabled={disabled} onChange={event => { text('continuePrompt', event.currentTarget.value) }} />
-            <span className={css.hint}>{t('continuePromptHint')}</span>
-          </label>
-
-          <div className={css.footer}>
-            <p className={restartFailed || restartStale ? css.failed : css.actionHint} role="status" aria-live="polite">
-              {restartStale ? t('restartStale') : restartFailed ? t('restartFailed') : restartSucceeded ? t('restartSucceeded') : t('restartHint')}
-            </p>
-            <button type="button" className={css.restart} disabled={restarting} onClick={() => { void restartNow() }}>
-              {t(restarting ? 'restarting' : 'restartNow')}
-            </button>
-          </div>
+    <SettingsForm
+      labels={{
+        unavailable: t('unavailable'),
+        readOnly: t('readOnly'),
+        saveFailed: t('saveFailed'),
+        save: t('save'),
+        saving: t('saving'),
+      }}
+      state={state}
+      onSave={props.save}
+      onDiscard={props.discard}
+    >
+      <div className={css.toggleRow}>
+        <div className={css.toggleCopy}>
+          <span className={css.label}>{t('legacyRestart')}</span>
+          <span className={css.hint}>{t('legacyRestartHint')}</span>
         </div>
-      ) : null}
-    </li>
+        <Switch
+          checked={state.legacyRestart}
+          onChange={(next) => { props.edit('legacyRestart', next ? 'true' : 'false') }}
+          label={t('legacyRestart')}
+          disabled={disabled}
+        />
+      </div>
+
+      <SettingsValueField
+        id="dsh-restart-continue-prompt"
+        label={t('continuePrompt')}
+        hint={t('continuePromptHint')}
+        overriddenLabel={t('overridden')}
+        resetLabel={t('reset')}
+        invalidLabel={t('invalidValue')}
+        disabled={disabled}
+        {...state.continuePrompt}
+        onEdit={(text) => { props.edit('continuePrompt', text) }}
+        onReset={() => { props.resetField('continuePrompt') }}
+      />
+
+      <div className={css.restartRow}>
+        <p className={restartFailed || restartStale ? css.failed : css.actionHint} role="status" aria-live="polite">
+          {restartStale ? t('restartStale') : restartFailed ? t('restartFailed') : restartSucceeded ? t('restartSucceeded') : t('restartHint')}
+        </p>
+        <button type="button" className={css.restart} disabled={restarting} onClick={() => { void restartNow() }}>
+          {t(restarting ? 'restarting' : 'restartNow')}
+        </button>
+      </div>
+    </SettingsForm>
   )
 }

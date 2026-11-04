@@ -19,6 +19,9 @@ const CLIENT_EXTERNALS = [
   '@deepseek-ai/cordis',
   '@deepseek-ai/dsh-client-store',
   '@deepseek-ai/dsh-client-ui-slots',
+  // Official platform module (packages/client/web/src/platform.ts), so the
+  // settings form and switch primitives resolve through the loader table.
+  '@deepseek-ai/dsh-client-ui-primitives',
 ] as const
 
 export default {

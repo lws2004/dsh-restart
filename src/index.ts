@@ -82,8 +82,10 @@ interface RestartConfig {
 }
 
 const RestartConfigSchema = z.object({
-  legacyRestart: z.boolean().default(false),
-  continuePrompt: z.string().default('（系统已重启完成）请继续之前未完成的工作。'),
+  // 标 .volatile() 才会被宿主 dsh-settings 的 volatileForm 收录进「插件配置」表单；
+  // 未标记的字段属于普通配置，只能在 cordis 配置文件里改，不会出现在 UI 配置页。
+  legacyRestart: z.boolean().default(false).volatile(),
+  continuePrompt: z.string().default('（系统已重启完成）请继续之前未完成的工作。').volatile(),
   resumeWaitMs: z.number().default(1800000),
   resumeMaxAgeMs: z.number().default(7200000),
   watchdogEnabled: z.boolean().default(false),
@@ -105,6 +107,18 @@ const DEFAULT_CONFIG: RestartConfig = {
   watchdogEnabled: false,
   watchdogCooldownMs: 60000,
   watchdogPollMs: 1000,
+}
+
+/**
+ * 解包 volatile 配置字段。
+ * 宿主按 schema 解析后，标了 .volatile() 的字段是一个带 .get() 的稳定引用
+ * （见 schemastery README「Volatile configuration」），并非裸值；而代码内的
+ * DEFAULT_CONFIG 回退值是裸值。统一解包成裸值，才能参与布尔判断与消息构造
+ * （否则把引用对象塞进 createUserMessage，会在 structuredClone 处抛 DataCloneError）。
+ */
+function readVolatile<T>(value: T | { get(): T }): T {
+  const box = value as { get?: unknown } | null | undefined
+  return typeof box?.get === 'function' ? (value as { get(): T }).get() : (value as T)
 }
 
 /** The "process file index": boot facts for external inspection. */
@@ -561,9 +575,15 @@ function isTrustedWebRestart(req: WebRestartRequest): boolean {
 
 /** Session ids that should resume after a deliberate restart. */
 function runningSessionIds(ctx: Context): string[] {
+  // 不仅要「正在跑」的会话：被中断后转 idle、但 inbox 里还留着排队/待步进工作
+  // 的会话同样需要恢复（例如重启打断了一个 turn，其排队输入仍在）——只看
+  // status==='running' 会把这些会话漏掉，重启后它们的任务就不再被继续。
   return [...new Set(
     ctx.agents.roots()
-      .filter(agent => agent.status === 'running')
+      .filter(agent =>
+        agent.status === 'running'
+        || (agent.inbox?.nextTurn?.length ?? 0) > 0
+        || (agent.inbox?.nextStep?.length ?? 0) > 0)
       .map(agent => String(agent.id)),
   )]
 }
@@ -575,7 +595,16 @@ function runningSessionIds(ctx: Context): string[] {
  * 重启被无限推迟。而 inbox 是持久投影(插入/认领/丢弃都是持久事实), 轮后新到的消息在重启后
  * 仍会被处理 —— 所以正确语义是「当前轮结束即重启, 新消息排队到重启后」, 而不是让新消息干扰重启。
  *
- * 触发: 目标会话的 `agent/turn-stopping`(轮次没有工具或 steering 后续时触发, 即轮末)。
+ * 触发点用 `turn/end` 而不是 `agent/turn-stopping`(2026-11-04 修正)。turn-stopping 在最后一个
+ * step 结束时触发, 此时 agent-loop 还没 append `turn/end`; 从这里起倒计时, 进程会在本轮落盘与
+ * 回送之前退出, 客户端把这轮判成「已中止, 未完成的工具调用结果未知」—— 即使工具其实都跑完了。
+ * `turn/end` 在 finally 里 append, 才是真正的轮末。
+ *
+ * 同时压住唤醒(2026-11-04): 倒计时一开始就把目标 agent 的 `send` 强制成 `wakeup=false`。
+ * 否则轮后到达的新消息会立刻拉起 agent 执行, 而倒计时仍在跑 —— 结果是「执行到一半被重启掐断,
+ * 重启后再重试」。压住后新消息只进持久 inbox, 由重启后的新进程照常处理; 重启失败则恢复原
+ * `send`, 避免消息永远不被唤醒。
+ *
  * 兜底: maxWaitMs 到点强制重启, 避免事件没到导致永不重启。
  */
 function scheduleRestartAfterTurnEnd(ctx: Context, sessionIds: string[], maxWaitMs: number): void {
@@ -583,6 +612,29 @@ function scheduleRestartAfterTurnEnd(ctx: Context, sessionIds: string[], maxWait
   let fired = false
   let dispose: (() => void) | undefined
   let timer: ReturnType<typeof setTimeout> | undefined
+  // 重启倒计时期间, 目标会话的新消息只进 inbox, 不唤醒 agent 执行。
+  const sessions: unknown[] = []
+  const restores: Array<() => void> = []
+  for (const agent of ctx.agents.roots()) {
+    if (!targets.has(String(agent.id))) continue
+    sessions.push(agent.session)
+    const original = agent.send
+    restores.push(() => {
+      agent.send = original
+    })
+    agent.send = function (this: unknown, message: never, target: never): void {
+      return original.call(this, message, target, false)
+    } as typeof agent.send
+  }
+  const restoreWakeups = (): void => {
+    for (const restore of restores.splice(0)) {
+      try {
+        restore()
+      } catch {
+        // 宿主可能在收尾, 恢复失败不影响重启本身。
+      }
+    }
+  }
   const fire = (reason: string): void => {
     if (fired) return
     fired = true
@@ -598,16 +650,17 @@ function scheduleRestartAfterTurnEnd(ctx: Context, sessionIds: string[], maxWait
       try {
         restart(0)
       } catch (error) {
+        restoreWakeups()
         debugLog('restart-after-turn-end: restart failed: ' + String(error))
       }
     }, 800)
   }
-  dispose = (ctx.on as (event: string, listener: (payload: unknown) => void) => () => void)(
-    'agent/turn-stopping',
-    (payload: unknown) => {
-      const id = String((payload as { agent?: { id?: unknown } } | undefined)?.agent?.id ?? '')
-      if (!targets.has(id)) return
-      fire('turn-stopping')
+  dispose = (ctx.on as (event: string, listener: (...args: unknown[]) => void) => () => void)(
+    'session/event',
+    (session: unknown, event: unknown) => {
+      if (!sessions.includes(session)) return
+      if ((event as { type?: string } | undefined)?.type !== 'turn/end') return
+      fire('turn-end')
     },
   )
   timer = setTimeout(() => fire('timeout'), Math.max(6000, Math.floor(maxWaitMs)))
@@ -673,7 +726,10 @@ async function restartLegacy(ctx: Context, delayMs: number, policy: unknown): Pr
   }
   if (policy !== undefined) request.sandboxPolicy = policy
   const spec = ctx.shell.resolve(request as never)
-  const result = await ctx.shell.run(spec)
+  // DSH 0.2 的 shell 服务把执行拆成 prepare/execute: resolve 补默认值,
+  // execute 返回句柄, 前台结果由句柄的 result() 投影给出。
+  const execution = await ctx.shell.execute(spec)
+  const result = await execution.result()
   const stdout = result.stdout && typeof result.stdout.text === 'string' ? result.stdout.text : ''
   const stderr = result.stderr && typeof result.stderr.text === 'string' ? result.stderr.text : ''
   if (result.exitCode !== 0) {
@@ -686,7 +742,7 @@ async function restartLegacy(ctx: Context, delayMs: number, policy: unknown): Pr
   }
 }
 
-export function apply(ctx: Context): void {
+export function apply(ctx: Context, config: RestartConfig): void {
   debugLog(`apply: start pid=${process.pid}`)
   try {
     writeProcessIndex()
@@ -695,20 +751,19 @@ export function apply(ctx: Context): void {
     debugLog('apply: writeProcessIndex THREW: ' + String(error))
   }
   disableLegacyWatchdog()
-  let resolveConfig: () => RestartConfig = () => DEFAULT_CONFIG
-  const dynamic = (): RestartConfig => resolveConfig()
-  try {
-    ctx.inject(['settings'], (settingsCtx) => {
-      // TS 5.9 对 schemastery 3.18.2 的 z.object() 推断出 Schema<ObjectS, ObjectT> (S≠T),
-      // 与 installSection 的 z<T> 不兼容; 运行时无差异, 用断言收敛到声明类型。
-      settingsCtx.settings.installSection(ctx, 'dsh-restart', RestartConfigSchema as unknown as z<RestartConfig>, DEFAULT_CONFIG, {
-        setSource: (get) => { resolveConfig = get },
-        onChange: () => {},
-      })
-    })
-    debugLog('apply: settings installed')
-  } catch (error) {
-    debugLog('apply: settings installSection THREW: ' + String(error))
+  // 宿主从本插件导出的 Config schema 派生配置页, 并把解析后的配置作为第二个参数传进来;
+  // 配置变化会让该 fiber 重新 apply, 所以闭包读到的始终是当前值。旧 installSection 已随
+  // DSH 0.2 移除, 保留它只会抛错并被吞掉、让配置恒为默认值。
+  const dynamic = (): RestartConfig => {
+    // config 来自宿主解析结果：两个 volatile 字段是带 .get() 的引用对象，先解包成裸值，
+    // 下游的布尔判断与 createUserMessage 才是普通数据。config 缺省时退回默认值。
+    const source = (config ?? DEFAULT_CONFIG) as RestartConfig
+    return {
+      ...DEFAULT_CONFIG,
+      ...source,
+      legacyRestart: readVolatile(source.legacyRestart),
+      continuePrompt: readVolatile(source.continuePrompt),
+    }
   }
 
   try {
@@ -788,8 +843,8 @@ export function apply(ctx: Context): void {
       // 下限 6000ms: 工具结果送达后还要留出模型生成这一轮文字回复并推到客户端的
       // 时间 —— 太短会出现「重启已执行, 但本轮消息没回送」, 只能靠人再发一条。
       const delayMs = Number(a.delayMs) > 0 ? Math.max(6000, Math.floor(Number(a.delayMs))) : 6000
-      // Only resume sessions that were mid-turn (running) at restart time. Idle
-      // (already-ended) conversations are left alone — the client re-opens them.
+      // 恢复「正在跑」或「inbox 还留有排队待办」的会话；完全 idle 且无待办的会话
+      // 留给客户端重开时处理（它们没有未完成的工作需要续）。
       const sessionIds = runningSessionIds(ctx)
       if (sessionIds.length > 0) writeResumeMarker(sessionIds)
       // 默认路径(2026-10-30): 等当前轮结束即重启 —— 比固定延迟灵敏(短回复不必白等),

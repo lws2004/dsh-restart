@@ -50,11 +50,23 @@ git show upstream/HEAD:src/index.ts  # 直接读上游某个文件
 |---|---|---|
 | npm `latest`（当前正式发布插件） | `dsh-v0.1.1-rc.2` | 已验证维护基线 |
 | npm `next` 候选（`0.1.3-alpha.5`） | `dsh-v0.1.5-alpha.1` | 精确依赖与真实 profile 验收目标 |
+| 本地开发版（`0.1.4`） | `dsh-v0.2.1-rc.5` | 已按 0.2 客户端契约改造，并在真实 web profile 验收 |
 | 后续 DSH 正式版 | 尚未发布 | 发布并完成真实 profile 门禁后再声明兼容 |
 
 开发版不会覆盖 npm `latest`。`0.1.5-alpha.1` 依赖按精确版本锁定；该版本已移除
 `@deepseek-ai/dsh-client-runtime`，客户端契约分别迁移到 Cordis、
 `dsh-client-store` 与 `dsh-client-ui-settings`，不会混装 rc.2 运行时。
+
+### `0.1.4` 变更
+
+- 适配 DSH 0.2 客户端契约：设置卡片从 `settingsScope` + `settings.plugin.item` 槽位
+  改为 `configForms` + `plugins.item` 槽位，改用官方 `SettingsForm` 表单组件。
+  旧契约下客户端模块会永远停在 `waiting for activation`，插件页报同步失败。
+- 服务端改由宿主从导出的 `Config` schema 派生配置页，删除已移除的
+  `settings.installSection` 调用——此前该调用静默失败，`legacyRestart` /
+  `continuePrompt` 恒为默认值、改不动。
+- 重启方式与继续提示词改为「暂存 + 保存」写入，与官方插件配置页行为一致。
+- 适配 DSH 0.2 的 shell 服务（`resolve` → `execute` → `result()`）。
 
 ### `0.1.3-alpha.4` 变更
 

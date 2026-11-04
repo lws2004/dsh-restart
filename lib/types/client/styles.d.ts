@@ -1,23 +1,10 @@
 /** Stable local class names; the plugin ships as one self-contained client.js. */
 export declare const styles: {
-    readonly card: "dsh-restart-card";
-    readonly cardOpen: "dsh-restart-card-open";
-    readonly header: "dsh-restart-header";
-    readonly headText: "dsh-restart-head-text";
-    readonly name: "dsh-restart-name";
-    readonly description: "dsh-restart-description";
-    readonly chevron: "dsh-restart-chevron";
-    readonly chevronOpen: "dsh-restart-chevron-open";
-    readonly body: "dsh-restart-body";
-    readonly readOnly: "dsh-restart-read-only";
-    readonly field: "dsh-restart-field";
-    readonly toggleField: "dsh-restart-toggle-field";
+    readonly toggleRow: "dsh-restart-toggle-row";
     readonly toggleCopy: "dsh-restart-toggle-copy";
     readonly label: "dsh-restart-label";
     readonly hint: "dsh-restart-hint";
-    readonly checkbox: "dsh-restart-checkbox";
-    readonly input: "dsh-restart-input";
-    readonly footer: "dsh-restart-footer";
+    readonly restartRow: "dsh-restart-restart-row";
     readonly actionHint: "dsh-restart-action-hint";
     readonly failed: "dsh-restart-failed";
     readonly restart: "dsh-restart-button";

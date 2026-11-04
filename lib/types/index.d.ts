@@ -19,6 +19,7 @@
  * @module dsh-restart
  */
 import type { Context } from '@deepseek-ai/cordis';
+import z from '@deepseek-ai/schemastery';
 export declare const name = "dsh-restart";
 export declare const inject: string[];
 /**
@@ -41,25 +42,41 @@ declare module '@deepseek-ai/dsh-llm' {
         'plugin:dsh-restart': RestartContinuationSource;
     }
 }
+/** Plugin configuration (editable via settings.yaml and, later, the UI card). */
+interface RestartConfig {
+    legacyRestart: boolean;
+    continuePrompt: string;
+    /** Auto-continue: polling fallback window right after boot (ms). */
+    resumeWaitMs: number;
+    /** Auto-continue: how long a resume marker stays valid before it is dropped (ms). */
+    resumeMaxAgeMs: number;
+    /** @deprecated Retained only so existing settings files remain readable. */
+    watchdogEnabled: boolean;
+    /** @deprecated The embedded watchdog is disabled and this value is ignored. */
+    watchdogCooldownMs: number;
+    /** @deprecated The embedded watchdog is disabled and this value is ignored. */
+    watchdogPollMs: number;
+}
 /**
  * dsh 0.1.7+ : 宿主从插件导出的 Config schema 派生「插件配置」表单(旧 installSection 已移除)。
  * 本地补丁:导出 Config 供宿主投影表单,命名空间即本插件的 profile entry id「dsh-restart」。
  */
-export declare const Config: import("@deepseek-ai/schemastery").default<Schemastery.ObjectS<NoInfer<{
-    legacyRestart: import("@deepseek-ai/schemastery").default<boolean, boolean, Mode extends "volatile" | "volatile-defined" ? "volatile-defined" : "defined">;
-    continuePrompt: import("@deepseek-ai/schemastery").default<string, string, Mode extends "volatile" | "volatile-defined" ? "volatile-defined" : "defined">;
-    resumeWaitMs: import("@deepseek-ai/schemastery").default<number, number, Mode extends "volatile" | "volatile-defined" ? "volatile-defined" : "defined">;
-    resumeMaxAgeMs: import("@deepseek-ai/schemastery").default<number, number, Mode extends "volatile" | "volatile-defined" ? "volatile-defined" : "defined">;
-    watchdogEnabled: import("@deepseek-ai/schemastery").default<boolean, boolean, Mode extends "volatile" | "volatile-defined" ? "volatile-defined" : "defined">;
-    watchdogCooldownMs: import("@deepseek-ai/schemastery").default<number, number, Mode extends "volatile" | "volatile-defined" ? "volatile-defined" : "defined">;
-    watchdogPollMs: import("@deepseek-ai/schemastery").default<number, number, Mode extends "volatile" | "volatile-defined" ? "volatile-defined" : "defined">;
+export declare const Config: z<Schemastery.ObjectS<NoInfer<{
+    legacyRestart: z<boolean, boolean, "volatile-defined">;
+    continuePrompt: z<string, string, "volatile-defined">;
+    resumeWaitMs: z<number, number, "defined">;
+    resumeMaxAgeMs: z<number, number, "defined">;
+    watchdogEnabled: z<boolean, boolean, "defined">;
+    watchdogCooldownMs: z<number, number, "defined">;
+    watchdogPollMs: z<number, number, "defined">;
 }>>, Schemastery.ObjectT<NoInfer<{
-    legacyRestart: import("@deepseek-ai/schemastery").default<boolean, boolean, Mode extends "volatile" | "volatile-defined" ? "volatile-defined" : "defined">;
-    continuePrompt: import("@deepseek-ai/schemastery").default<string, string, Mode extends "volatile" | "volatile-defined" ? "volatile-defined" : "defined">;
-    resumeWaitMs: import("@deepseek-ai/schemastery").default<number, number, Mode extends "volatile" | "volatile-defined" ? "volatile-defined" : "defined">;
-    resumeMaxAgeMs: import("@deepseek-ai/schemastery").default<number, number, Mode extends "volatile" | "volatile-defined" ? "volatile-defined" : "defined">;
-    watchdogEnabled: import("@deepseek-ai/schemastery").default<boolean, boolean, Mode extends "volatile" | "volatile-defined" ? "volatile-defined" : "defined">;
-    watchdogCooldownMs: import("@deepseek-ai/schemastery").default<number, number, Mode extends "volatile" | "volatile-defined" ? "volatile-defined" : "defined">;
-    watchdogPollMs: import("@deepseek-ai/schemastery").default<number, number, Mode extends "volatile" | "volatile-defined" ? "volatile-defined" : "defined">;
+    legacyRestart: z<boolean, boolean, "volatile-defined">;
+    continuePrompt: z<string, string, "volatile-defined">;
+    resumeWaitMs: z<number, number, "defined">;
+    resumeMaxAgeMs: z<number, number, "defined">;
+    watchdogEnabled: z<boolean, boolean, "defined">;
+    watchdogCooldownMs: z<number, number, "defined">;
+    watchdogPollMs: z<number, number, "defined">;
 }>>, "plain">;
-export declare function apply(ctx: Context): void;
+export declare function apply(ctx: Context, config: RestartConfig): void;
+export {};
