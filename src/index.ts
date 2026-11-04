@@ -340,7 +340,16 @@ function tryAutoContinue(ctx: Context, dynamic: () => RestartConfig): void {
         console.error('[dsh-restart] failed to replay a held message:', error)
       }
     }
-    if (held.length > 0) debugLog(`auto-continue: replayed ${held.length} held message(s) for ${sessionId}`)
+    if (held.length > 0) {
+      // 重放了用户消息: 它本身就是唤醒源, 再注入「继续」只会让 agent 多跑一轮空转。
+      debugLog(`auto-continue: replayed ${held.length} held message(s) for ${sessionId}, skipping the continuation prompt`)
+      pending.delete(sessionId)
+      if (pending.size === 0) {
+        debugLog('auto-continue: all sessions continued')
+        finish()
+      }
+      return
+    }
     debugLog(`auto-continue: agent for ${sessionId} is live (${via}), following up`)
     try {
       ;(agent as { followup: (message: unknown) => unknown }).followup(createUserMessage({
