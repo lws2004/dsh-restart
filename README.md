@@ -122,9 +122,13 @@ host 半由 `tsc` 输出到 `lib/index.js`（`@deepseek-ai/*` 保持外部依赖
 
 #### What the model sees
 
-The host half registers one model-callable tool, `restart_harness`, with an
-optional `delayMs`. Calling it schedules a full process restart and returns
-immediately; the model does not wait for the process to come back. The client
+The host half registers one model-callable tool, `restart_harness`. Calling it
+schedules a full process restart and returns immediately; the model does not
+wait for the process to come back. By default (`waitForTurnEnd`, on) the restart
+fires only after every active root session has finished its turn and drained its
+inbox, so a running conversation is never cut mid-turn and messages sent while
+the restart is pending still run to completion; `maxWaitMs` (default five
+minutes) forces the restart through when a session never goes idle. The client
 half adds a `/restart` slash command and a 「立即重启」 button in the plugin
 settings card, so a human can trigger the same path from the UI.
 
@@ -155,8 +159,9 @@ continuation prompt starts a fresh prefix.
   非 launchd 环境(手工拉起的常驻进程)仍走原生 detached helper 路径。
 - **kickstart 失败会退回原生路径** — 若 `launchctl kickstart` 报错, 插件退回
   自派生 helper 以免完全无法重启; 此时才会出现与 launchd 抢端口的风险。
-- **重启即中断** — `restart_harness` 立即返回, 正在执行的工具调用与子进程会被
-  宿主终止; 需要等待结果的场景要先落盘。
+- **强制重启仍会中断** — 默认路径会等所有活跃会话空闲, 但 `maxWaitMs` 兜底
+  到点(或显式传 `waitForTurnEnd=false`)时仍会在执行中重启: 正在跑的工具调用与
+  子进程会被宿主终止; 需要等待结果的场景要先落盘。
 - **launchd 路径下「安排成功」日志不落盘** — `launchctl kickstart -k` 会把当前进程
   SIGKILL 掉(launchd 记录的 last exit status 为 `-9`), 而 `spawnSync` 正阻塞在
   等 launchctl 返回, 进程在写 `launchd kickstart scheduled` 之前就死了, 该行
