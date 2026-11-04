@@ -24,3 +24,28 @@
 export function needsResume(status: string | undefined): boolean {
   return status === 'running'
 }
+/** 判据读取的 inbox 子集(只关心队列里有没有真实用户输入)。 */
+export interface RestartInboxAgent {
+  readonly inbox?: {
+    readonly nextTurn?: readonly unknown[]
+    readonly nextStep?: readonly unknown[]
+  }
+}
+
+/**
+ * 会话的 inbox 里是否已经排着真实用户输入。
+ *
+ * 重启完成时若用户已经发过消息(它已经进了队列), 再注入「继续之前未完成的工作」只会让
+ * agent 先跑一轮空转、用户消息被排到后面 —— 也就是「收到两个消息, 回送的那条在后面」。
+ * 判据只认真实用户输入(source.kind === 'user'), 插件注入的上下文不算。
+ *
+ * @param agent - Agent 形态的值(状态 + inbox)。
+ * @returns 队列里存在真实用户输入时为 true。
+ */
+export function hasUserPending(agent: RestartInboxAgent): boolean {
+  const pending = [...(agent.inbox?.nextTurn ?? []), ...(agent.inbox?.nextStep ?? [])]
+  return pending.some((message) => {
+    const kind = (message as { source?: { kind?: unknown } } | undefined)?.source?.kind
+    return kind === 'user'
+  })
+}
