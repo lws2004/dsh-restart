@@ -235,6 +235,57 @@ function clearResumeMarker(): void {
   try { fs.unlinkSync(resumeFilePath()) } catch { /* already gone */ }
 }
 
+/** 重启排程期间被拦下的用户消息: 会话 id → 待重放消息。 */
+const HELD_FILENAME = 'dsh-restart-held.json'
+
+interface HeldMessages {
+  sessions: Record<string, unknown[]>
+}
+
+function heldFilePath(): string {
+  return path.join(homeDir(), HELD_FILENAME)
+}
+
+/** 读排程期间拦下的消息; 文件缺失或损坏时视为空表。 */
+function readHeld(): HeldMessages {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(heldFilePath(), 'utf8')) as { sessions?: unknown }
+    const sessions = parsed.sessions
+    if (sessions === undefined || sessions === null || typeof sessions !== 'object') return { sessions: {} }
+    return { sessions: sessions as Record<string, unknown[]> }
+  } catch {
+    return { sessions: {} }
+  }
+}
+
+/** 追加一条拦下的消息并落盘 —— 重启失败时这些消息仍能放回队列。 */
+function appendHeld(sessionId: string, message: unknown): void {
+  try {
+    const held = readHeld()
+    const list = held.sessions[sessionId] ?? []
+    list.push(message)
+    held.sessions[sessionId] = list
+    fs.writeFileSync(heldFilePath(), JSON.stringify(held, null, 2) + '\n', 'utf8')
+  } catch (error) {
+    console.error('[dsh-restart] failed to persist a held message:', error)
+  }
+}
+
+/** 取走并清除某个会话拦下的消息。 */
+function takeHeld(sessionId: string): unknown[] {
+  const held = readHeld()
+  const list = held.sessions[sessionId] ?? []
+  if (list.length === 0) return []
+  delete held.sessions[sessionId]
+  try {
+    if (Object.keys(held.sessions).length === 0) fs.unlinkSync(heldFilePath())
+    else fs.writeFileSync(heldFilePath(), JSON.stringify(held, null, 2) + '\n', 'utf8')
+  } catch (error) {
+    console.error('[dsh-restart] failed to clear held messages:', error)
+  }
+  return list
+}
+
 /**
  * After a restart, wait for the recorded session to be resumed (the client
  * re-opens it) and then inject one "continue" follow-up so the agent picks up
@@ -279,6 +330,17 @@ function tryAutoContinue(ctx: Context, dynamic: () => RestartConfig): void {
   }
 
   const deliver = (agent: unknown, sessionId: string, via: string): void => {
+    // 先把重启排程期间拦下的用户消息放回队列: 拦下它们是为了不让 agent 在轮末自行续跑
+    // (那一轮必然被重启掐断), 重启完成后按原顺序重放, 再注入继续提示。
+    const held = takeHeld(sessionId)
+    for (const message of held) {
+      try {
+        ;(agent as { send: (m: unknown, t: string, w: boolean) => void }).send(message, 'next-turn', true)
+      } catch (error) {
+        console.error('[dsh-restart] failed to replay a held message:', error)
+      }
+    }
+    if (held.length > 0) debugLog(`auto-continue: replayed ${held.length} held message(s) for ${sessionId}`)
     debugLog(`auto-continue: agent for ${sessionId} is live (${via}), following up`)
     try {
       ;(agent as { followup: (message: unknown) => unknown }).followup(createUserMessage({
@@ -624,10 +686,41 @@ function scheduleRestartAfterTurnEnd(ctx: Context, initiatorId: string | undefin
   let settleTimer: ReturnType<typeof setTimeout> | undefined
 
   const initiator = initiatorId === undefined ? undefined : ctx.agents.get(initiatorId as never) as {
+    id?: unknown
     status?: string
     session?: unknown
     whenIdle?: () => Promise<void>
+    send?: (message: unknown, target: unknown, wakeup: unknown) => void
   } | undefined
+  const heldSessionId = String(initiator?.id ?? initiatorId ?? '')
+  const originalSend = initiator?.send
+
+  /**
+   * 重启已排程: 拦下这个会话的新消息, 不让它们进 inbox。
+   *
+   * 进 inbox 就会被 agent loop 在轮末自行续跑(它只看 `inbox.hasPending`), 那一轮必然
+   * 被重启从中间掐断, 会话里留下 reason=interrupted。拦下并落盘, 由重启后的 auto-continue
+   * 按原顺序重放 —— 也就是「已发出 restart_harness 之后的消息延迟到重启完成再处理」。
+   */
+  const holdIncoming = (): void => {
+    if (initiator === undefined || typeof originalSend !== 'function') return
+    initiator.send = function (this: unknown, message: unknown): void {
+      appendHeld(heldSessionId, message)
+      debugLog('restart-after-turn-end: held a message while the restart is pending')
+    }
+  }
+
+  /** 重启没发生: 恢复投递, 并把拦下的消息立刻放回队列, 不让它们滞留在暂存里。 */
+  const releaseHeld = (): void => {
+    if (initiator !== undefined && typeof originalSend === 'function') initiator.send = originalSend
+    for (const message of takeHeld(heldSessionId)) {
+      try {
+        originalSend?.call(initiator, message, 'next-turn', true)
+      } catch {
+        // 队列可能已随宿主收尾关闭; 消息已落盘, 下次启动重放。
+      }
+    }
+  }
 
   const restartNow = (reason: string): void => {
     if (settled) return
@@ -638,6 +731,7 @@ function scheduleRestartAfterTurnEnd(ctx: Context, initiatorId: string | undefin
       restart(0)
     } catch (error) {
       debugLog('restart-after-turn-end: restart failed: ' + String(error))
+      releaseHeld()
     }
   }
 
@@ -696,6 +790,7 @@ function scheduleRestartAfterTurnEnd(ctx: Context, initiatorId: string | undefin
     timer = setTimeout(() => restartNow('timeout'), Math.max(6000, Math.floor(maxWaitMs)))
   }
 
+  holdIncoming()
   if (initiator === undefined || initiator.session === undefined || initiator.status !== 'running') {
     fire('no-active-turn')
     return
