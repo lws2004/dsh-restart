@@ -38,7 +38,7 @@ import path from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { relaunchHelperSource } from './relaunch-helper.js'
 import { RestartCoordinator } from './restart-coordinator.js'
-import { allRootsIdle, needsResume } from './restart-idle.js'
+import { needsResume } from './restart-idle.js'
 import { superviseRestartHelper } from './restart-helper-lifecycle.js'
 
 export const name = 'dsh-restart'
@@ -574,53 +574,35 @@ function isTrustedWebRestart(req: WebRestartRequest): boolean {
   }
 }
 
-/** Session ids that should resume after a deliberate restart. */
+/** 重启后需要注入「继续」提示的会话：跑过任务、且当前轮仍在运行。 */
 function runningSessionIds(ctx: Context): string[] {
-  // 不仅要「正在跑」的会话：被中断后转 idle、但 inbox 里还留着真实用户输入的会话同样
-  // 需要恢复（例如重启打断了一个 turn，其排队输入仍在）——只看 status==='running'
-  // 会把这些会话漏掉，重启后它们的任务就不再被继续。
-  //
-  // 但「排队工作」只算真实用户输入（source.kind === 'user'）：新会话创建时插件会往
-  // inbox 注入上下文（kind 形如 'plugin:<name>'），若把注入也算作待办，一个用户从未
-  // 使用过的空白会话会在每次重启时被拉起，列表里凭空多出一个未命名会话。
+  // 正在跑 = 有轮次在跑 = 跑过任务。空白会话与已结束的会话恒为 idle, 不会被恢复,
+  // 也就不会在重启后凭空多出一个未命名会话。
   return [...new Set(
     ctx.agents.roots()
-      .filter(agent => needsResume(agent))
+      .filter(agent => needsResume(agent.status))
       .map(agent => String(agent.id)),
   )]
 }
 
 /**
- * 等「所有活跃会话都空闲」再重启(2026-11-04 二次修正)。
+ * 等「发起重启的那个会话的当前轮」结束后再重启(2026-11-04 三次修正)。
  *
- * 为什么不能只看单个 turn/end: 本机常同时有多个会话在跑(后台任务、子代理、另一个窗口的对话)。
- * 任意一个会话结束一轮就重启, 会把其他正在执行的会话连同它们刚接手的用户消息一起掐断 ——
- * 用户看到的是「消息发出去了、也执行了, 但没跑完」。判定必须是所有活跃会话都不在 running,
- * 且 inbox 没有排队待办; 每个 turn/end 都重新判定, 直到全部空闲才真正重启。
+ * 只等发起会话, 不等所有会话: 本机常同时有多个会话在跑(后台任务、子代理、另一个窗口的
+ * 对话), 等它们全部空闲会把重启无限推迟。其他会话若被打断, 由重启后的 auto-continue 按
+ * 「跑过任务且轮在运行中」的判据恢复 —— 那正是 continue 提示存在的意义。
  *
- * 为什么不再压制 send: 早先把目标 agent 的 `send` 强制成 `wakeup=false`, 想让轮后新消息只排队
- * 不执行。但 agent loop 在 turn/end 之后只要 inbox 非空就会自行续跑(`if (!this.inbox.hasPending)
- * return false`), wakeup=false 挡不住这条路径 —— 消息照样被执行, 重启照样掐断。正确语义是
- * 「让消息正常跑完再重启」: 用户发消息立刻得到响应, 重启排在这一轮之后。
- *
- * 触发点仍是 `turn/end`(不是 `agent/turn-stopping`): 后者在最后一个 step 结束时触发, 此时
+ * 触发点用 `turn/end` 而不是 `agent/turn-stopping`: 后者在最后一个 step 结束时触发, 此时
  * agent-loop 还没 append `turn/end`, 从这里起倒计时会让进程在本轮落盘与回送之前退出。
  *
- * 兜底: maxWaitMs 到点强制重启, 避免某个会话长期不空闲导致永不重启。
+ * 没有发起会话(UI 触发)或它当前没在跑时直接排程 —— 没有需要等的轮次。
+ *
+ * 兜底: maxWaitMs 到点强制重启, 避免轮次长期不结束导致永不重启。
  */
-function scheduleRestartAfterTurnEnd(ctx: Context, maxWaitMs: number): void {
+function scheduleRestartAfterTurnEnd(ctx: Context, initiatorId: string | undefined, maxWaitMs: number): void {
   let fired = false
   let dispose: (() => void) | undefined
   let timer: ReturnType<typeof setTimeout> | undefined
-  let probe: ReturnType<typeof setTimeout> | undefined
-
-  /**
-   * 所有活跃 root 会话都不在 running、且 inbox 没有排队待办。
-   *
-   * 判据按**当前**的 roots 求值, 而不是按调度时的会话名单: 倒计时期间用户新建的会话同样会被
-   * 等进来, 否则它会成为「其他会话都空闲、它却被重启掐断」的漏网者。
-   */
-  const allIdle = (): boolean => allRootsIdle(ctx.agents.roots())
 
   const fire = (reason: string): void => {
     if (fired) return
@@ -631,7 +613,6 @@ function scheduleRestartAfterTurnEnd(ctx: Context, maxWaitMs: number): void {
       // 监听器可能已随宿主收尾释放, 不影响重启。
     }
     if (timer !== undefined) clearTimeout(timer)
-    if (probe !== undefined) clearTimeout(probe)
     debugLog('restart-after-turn-end: firing (' + reason + ')')
     // 轮末到回送完成之间还有一小段收尾, 留 800ms 再 kickstart, 避免回复没送达。
     setTimeout(() => {
@@ -643,25 +624,24 @@ function scheduleRestartAfterTurnEnd(ctx: Context, maxWaitMs: number): void {
     }, 800)
   }
 
-  const check = (): void => {
-    if (fired) return
-    if (probe !== undefined) clearTimeout(probe)
-    // turn/end 是在 driver 收尾前 append 的, 此刻 status 仍是 running; 让出当前 tick 再判定。
-    probe = setTimeout(() => {
-      if (allIdle()) fire('all-idle')
-    }, 100)
+  const initiator = initiatorId === undefined ? undefined : ctx.agents.get(initiatorId as never) as {
+    status?: string
+    session?: unknown
+  } | undefined
+  if (initiator === undefined || initiator.session === undefined || initiator.status !== 'running') {
+    fire('no-active-turn')
+    return
   }
-
+  const session = initiator.session
   dispose = (ctx.on as (event: string, listener: (...args: unknown[]) => void) => () => void)(
     'session/event',
-    (_session: unknown, event: unknown) => {
+    (candidate: unknown, event: unknown) => {
+      if (candidate !== session) return
       if ((event as { type?: string } | undefined)?.type !== 'turn/end') return
-      check()
+      fire('turn-end')
     },
   )
   timer = setTimeout(() => fire('timeout'), Math.max(6000, Math.floor(maxWaitMs)))
-  // 调度时就判一次: 已经全部空闲(常见于没有会话在跑)时不必等 turn/end 事件。
-  check()
 }
 
 /**
@@ -820,13 +800,13 @@ export function apply(ctx: Context, config: RestartConfig): void {
     description:
       '重启整个 DeepSeek Harness 进程，用于重新加载插件与配置（profile 的 cordis 组合、settings 等）。'
       + '**无必填参数**：直接调用（传空对象）即按推荐默认执行，无需先想传什么。'
-      + '默认 waitForTurnEnd=true：本工具立即返回，真正的重启排在所有活跃会话都空闲之后，'
-      + '因此不会掐断任何正在执行的会话、也不需要你停手；期间新到的用户消息照常执行，执行完再重启。'
+      + '默认 waitForTurnEnd=true：本工具立即返回，真正的重启排在发起重启的会话当前轮结束之后，'
+      + '因此不会掐断本轮；其他正在跑的会话会被打断，重启后自动注入继续提示恢复。'
       + '重启完成后自动注入「请继续之前未完成的工作」恢复会话。'
       + 'waitForTurnEnd=false 退回旧的固定延迟行为（此时调用后本轮不要再发起工具调用）。'
       + '返回旧进程 pid、cwd、命令行与日志文件路径。',
     parameters: {
-      waitForTurnEnd: { type: 'boolean', description: '等所有活跃会话空闲再重启（默认 true）：工具立即返回，重启排在所有正在执行的会话结束之后；期间新到的消息照常执行。' },
+      waitForTurnEnd: { type: 'boolean', description: '等本轮结束再重启（默认 true）：工具立即返回，重启排在发起重启的会话当前轮结束之后；其他正在跑的会话会被打断，重启后自动继续。' },
       maxWaitMs: { type: 'number', description: 'waitForTurnEnd 的最长等待毫秒数，超时强制重启，默认 300000（5 分钟；长轮次与后台任务需要更长等待，过早强制会掐断执行）。' },
       delayMs: { type: 'number', description: '固定延迟重启（仅 waitForTurnEnd=false 时生效），默认且不低于 6000。' },
     },
@@ -850,7 +830,7 @@ export function apply(ctx: Context, config: RestartConfig): void {
       const waitForTurnEnd = a.waitForTurnEnd !== false
       if (waitForTurnEnd && !dynamic().legacyRestart) {
         const maxWaitMs = Number(a.maxWaitMs) > 0 ? Math.floor(Number(a.maxWaitMs)) : 300000
-        scheduleRestartAfterTurnEnd(ctx, maxWaitMs)
+        scheduleRestartAfterTurnEnd(ctx, sessionIdOf(exec?.agent), maxWaitMs)
         return { ...pendingRestartInfo(), sessionIds, mode: 'after-turn-end', maxWaitMs }
       }
       if (dynamic().legacyRestart) {
