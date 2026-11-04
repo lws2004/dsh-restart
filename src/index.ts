@@ -134,6 +134,7 @@ const LEGACY_WATCHDOG_STOP_FILENAME = 'dsh-stop.flag'
 /** Stable identity for this loaded DSH process. */
 const PROCESS_STARTED_AT = new Date(performance.timeOrigin).toISOString()
 
+
 function homeDir(): string {
   return process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
 }
@@ -595,18 +596,39 @@ function runningSessionIds(ctx: Context): string[] {
  * 触发点用 `turn/end` 而不是 `agent/turn-stopping`: 后者在最后一个 step 结束时触发, 此时
  * agent-loop 还没 append `turn/end`, 从这里起倒计时会让进程在本轮落盘与回送之前退出。
  *
+ * fire 之后不等固定时长, 而是等 `whenIdle()` 收敛: turn/end 只是当前轮落盘, 轮后排队的新
+ * 消息会让 agent 立刻开下一轮, 固定延迟会把那一轮从中间杀掉(会话里留下 reason=interrupted,
+ * 客户端显示「任务已停止」)。whenIdle 等的是整个 activity 收尾, 它 resolve 时本轮才算真正
+ * 输出完。maxWaitMs 只作兜底 —— 用户持续发消息时 whenIdle 不会收敛。
+ *
  * 没有发起会话(UI 触发)或它当前没在跑时直接排程 —— 没有需要等的轮次。
  *
  * 恢复名单在发出 fire 的那一刻统计: 调度时的快照会过时(调度到 fire 之间可能有人开跑),
- * 而等到 800ms 收尾之后再算又太晚(agent 已切回 idle, 被打断的会话会被漏掉)。名单即
- * 「fire 时仍在跑」的会话 —— 它们正是这次重启会打断、需要注入「继续」的任务。
- *
- * 兜底: maxWaitMs 到点强制重启, 避免轮次长期不结束导致永不重启。
+ * 等到收尾之后再算又太晚(agent 已切回 idle, 被打断的会话会被漏掉)。名单即「fire 时仍在跑」
+ * 的会话 —— 它们正是这次重启会打断、需要注入「继续」的任务。
  */
 function scheduleRestartAfterTurnEnd(ctx: Context, initiatorId: string | undefined, maxWaitMs: number): void {
   let fired = false
+  let settled = false
   let dispose: (() => void) | undefined
   let timer: ReturnType<typeof setTimeout> | undefined
+
+  const initiator = initiatorId === undefined ? undefined : ctx.agents.get(initiatorId as never) as {
+    status?: string
+    session?: unknown
+    whenIdle?: () => Promise<void>
+  } | undefined
+
+  const restartNow = (reason: string): void => {
+    if (settled) return
+    settled = true
+    debugLog('restart-after-turn-end: restarting (' + reason + ')')
+    try {
+      restart(0)
+    } catch (error) {
+      debugLog('restart-after-turn-end: restart failed: ' + String(error))
+    }
+  }
 
   const fire = (reason: string): void => {
     if (fired) return
@@ -618,9 +640,9 @@ function scheduleRestartAfterTurnEnd(ctx: Context, initiatorId: string | undefin
     }
     if (timer !== undefined) clearTimeout(timer)
     debugLog('restart-after-turn-end: firing (' + reason + ')')
-    // 恢复名单在发出 fire 的这一刻统计, 不能等到 800ms 收尾之后再算: 收尾期间 agent 会切回
-    // idle, 那一刻仍在跑的会话会被漏掉, 而它们正是会被这次重启打断、需要恢复的任务。
-    // 也不用调度时的快照 —— 调度到 fire 之间可能已经有人开跑。
+    // 恢复名单在发出 fire 的这一刻统计: 调度时的快照会过时(调度到 fire 之间可能有人开跑),
+    // 等到收尾之后再算又太晚(agent 已切回 idle, 被打断的会话会被漏掉)。名单即「fire 时仍在
+    // 跑」的会话 —— 它们正是这次重启会打断、需要注入「继续」的任务。
     try {
       const latest = runningSessionIds(ctx)
       if (latest.length > 0) writeResumeMarker(latest)
@@ -629,20 +651,21 @@ function scheduleRestartAfterTurnEnd(ctx: Context, initiatorId: string | undefin
     } catch (error) {
       debugLog('restart-after-turn-end: marker refresh failed: ' + String(error))
     }
-    // 轮末到回送完成之间还有一小段收尾, 留 800ms 再 kickstart, 避免回复没送达。
-    setTimeout(() => {
-      try {
-        restart(0)
-      } catch (error) {
-        debugLog('restart-after-turn-end: restart failed: ' + String(error))
-      }
-    }, 800)
+    // 主路径: 等本轮真正输出完 —— `whenIdle()` 收敛的是整个 activity, 不只是当前 turn。
+    // turn/end 之后 agent 会立刻接手 next-turn 里排队的消息开下一轮, 用固定延迟重启会把
+    // 那一轮从中间杀掉(会话里留下 reason=interrupted, 客户端显示「任务已停止」)。
+    if (initiator !== undefined && typeof initiator.whenIdle === 'function') {
+      void Promise.resolve(initiator.whenIdle()).then(
+        () => restartNow('idle'),
+        () => restartNow('idle-failed'),
+      )
+    } else {
+      restartNow('no-when-idle')
+    }
+    // 兜底: 用户持续发消息时 whenIdle 不会收敛, 到点强制重启。
+    timer = setTimeout(() => restartNow('timeout'), Math.max(6000, Math.floor(maxWaitMs)))
   }
 
-  const initiator = initiatorId === undefined ? undefined : ctx.agents.get(initiatorId as never) as {
-    status?: string
-    session?: unknown
-  } | undefined
   if (initiator === undefined || initiator.session === undefined || initiator.status !== 'running') {
     fire('no-active-turn')
     return
