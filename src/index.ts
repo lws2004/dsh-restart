@@ -38,7 +38,7 @@ import path from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { relaunchHelperSource } from './relaunch-helper.js'
 import { RestartCoordinator } from './restart-coordinator.js'
-import { hasUserPending, needsResume } from './restart-idle.js'
+import { drainQueuedMessages, hasUserPending, needsResume } from './restart-idle.js'
 import { superviseRestartHelper } from './restart-helper-lifecycle.js'
 
 export const name = 'dsh-restart'
@@ -135,11 +135,11 @@ const LEGACY_WATCHDOG_STOP_FILENAME = 'dsh-stop.flag'
 const PROCESS_STARTED_AT = new Date(performance.timeOrigin).toISOString()
 
 /**
- * whenIdle 收敛之后的送达余量(ms)。
+ * turn/end 之后的送达余量(ms)。
  *
  * 宿主把轮末事件写进 SSE 是同步的, 但客户端渲染与断线重连后的状态对账仍要时间; 进程在这段
  * 时间里被杀, 客户端会把刚结束的那一轮判成「任务已停止」。服务端没有客户端 ACK, 只能给一个
- * 足够短又足够安全的余量 —— 它不是超时: 到点还要复查 agent 是否真的空闲, 期间又开跑就重新等。
+ * 足够短又足够安全的余量 —— 它不是超时: 到点直接重启, 排队消息已在 fire 时扣下。
  */
 const RESTART_DELIVERY_SETTLE_MS = 1000
 
@@ -687,10 +687,15 @@ function runningSessionIds(ctx: Context): string[] {
  * 触发点用 `turn/end` 而不是 `agent/turn-stopping`: 后者在最后一个 step 结束时触发, 此时
  * agent-loop 还没 append `turn/end`, 从这里起倒计时会让进程在本轮落盘与回送之前退出。
  *
- * fire 之后不等固定时长, 而是等 `whenIdle()` 收敛: turn/end 只是当前轮落盘, 轮后排队的新
- * 消息会让 agent 立刻开下一轮, 固定延迟会把那一轮从中间杀掉(会话里留下 reason=interrupted,
- * 客户端显示「任务已停止」)。whenIdle 等的是整个 activity 收尾, 它 resolve 时本轮才算真正
- * 输出完。maxWaitMs 只作兜底 —— 用户持续发消息时 whenIdle 不会收敛。
+ * fire 发生在 turn/end 的同步监听器里, 此刻立即扣下 inbox 中已排队但未开跑的消息
+ * (drainQueuedMessages): 否则 agent-loop 在 turn/end 之后看到「inbox.hasPending」会立刻
+ * 开下一轮, 把重启推迟到那一轮结束 —— 这正是「restart_harness 已发出、用户消息又触发
+ * 继续执行、重启几分钟后才落地」的根因(2026-11-05 实测: 00:30:43 发出, 00:34:43 才执行,
+ * 中间被一条排队消息拖了整整一轮)。
+ *
+ * 因此 fire 之后只留 RESTART_DELIVERY_SETTLE_MS 的送达余量, **不再等 whenIdle**: 用户
+ * 口径是「只等当前轮跑完就触发」, turn/end 就是当前轮结束, 后续消息已被扣下并在重启后
+ * 重放, 不需要也不应该再等一轮。maxWaitMs 只作兜底。
  *
  * 没有发起会话(UI 触发)或它当前没在跑时直接排程 —— 没有需要等的轮次。
  *
@@ -709,7 +714,11 @@ function scheduleRestartAfterTurnEnd(ctx: Context, initiatorId: string | undefin
     id?: unknown
     status?: string
     session?: unknown
-    whenIdle?: () => Promise<void>
+    inbox?: {
+      readonly nextTurn: readonly unknown[]
+      readonly nextStep: readonly unknown[]
+      splice: (target: 'next-turn' | 'next-step', start: number, deleteCount: number, inserted: unknown[]) => unknown[]
+    }
     send?: (message: unknown, target: unknown, wakeup: unknown) => void
   } | undefined
   const heldSessionId = String(initiator?.id ?? initiatorId ?? '')
@@ -727,6 +736,27 @@ function scheduleRestartAfterTurnEnd(ctx: Context, initiatorId: string | undefin
     initiator.send = function (this: unknown, message: unknown): void {
       appendHeld(heldSessionId, message)
       debugLog('restart-after-turn-end: held a message while the restart is pending')
+    }
+  }
+
+  /**
+   * 扣下 inbox 里已排队但尚未开跑的消息。
+   *
+   * holdIncoming 只能拦住 patch 之后的新 send 调用; 用户在本轮运行期间已经发进 inbox 的
+   * 消息不受影响 —— turn/end 之后 agent-loop 会立即 claim 它们开下一轮, 重启被拖到下一轮
+   * 结束。这里在 fire 的同步监听器里清空两个 pending 队列, 保证本轮结束后不会再有新轮开跑,
+   * 消息落盘等待重启后重放。
+   */
+  const holdQueuedInbox = (): void => {
+    if (initiator?.inbox === undefined) return
+    try {
+      const held = drainQueuedMessages(initiator.inbox)
+      for (const message of held) appendHeld(heldSessionId, message)
+      if (held.length > 0) {
+        debugLog(`restart-after-turn-end: held ${held.length} queued message(s) while the restart is pending`)
+      }
+    } catch (error) {
+      debugLog('restart-after-turn-end: failed to hold queued messages: ' + String(error))
     }
   }
 
@@ -765,6 +795,8 @@ function scheduleRestartAfterTurnEnd(ctx: Context, initiatorId: string | undefin
     }
     if (timer !== undefined) clearTimeout(timer)
     debugLog('restart-after-turn-end: firing (' + reason + ')')
+    // 先扣下已排队的消息, 再统计恢复名单: 清空 inbox 后宿主不会再开下一轮, 本轮结束即可重启。
+    holdQueuedInbox()
     // 恢复名单在发出 fire 的这一刻统计: 调度时的快照会过时(调度到 fire 之间可能有人开跑),
     // 等到收尾之后再算又太晚(agent 已切回 idle, 被打断的会话会被漏掉)。名单即「fire 时仍在
     // 跑」的会话 —— 它们正是这次重启会打断、需要注入「继续」的任务。
@@ -776,37 +808,16 @@ function scheduleRestartAfterTurnEnd(ctx: Context, initiatorId: string | undefin
     } catch (error) {
       debugLog('restart-after-turn-end: marker refresh failed: ' + String(error))
     }
-    // 主路径: 等本轮真正输出完 —— `whenIdle()` 收敛的是整个 activity, 不只是当前 turn。
-    // turn/end 之后 agent 会立刻接手 next-turn 里排队的消息开下一轮, 用固定延迟重启会把
-    // 那一轮从中间杀掉(会话里留下 reason=interrupted, 客户端显示「任务已停止」)。
-    // 收敛之后再留一个送达余量: 事件写进 SSE 是同步的, 但客户端渲染与重连对账仍要时间。
-    // 余量内若又开跑(用户又发了消息), 就重新等, 绝不抢在回送中间动手。
+    // 主路径: turn/end 已到 = 当前轮结束。不再等 whenIdle(它会把后续轮次也算进来),
+    // 只留一个送达余量让本轮回复写进 SSE 并渲染; 排队消息已在 fire 时扣下, 不会再有下一轮。
     const settleThenRestart = (): void => {
       if (settled) return
-      const agent = initiator
-      if (agent === undefined || typeof agent.whenIdle !== 'function') {
-        restartNow('no-when-idle')
-        return
-      }
-      void Promise.resolve(agent.whenIdle()).then(
-        () => {
-          if (settled) return
-          settleTimer = setTimeout(() => {
-            if (settled) return
-            if (agent.status !== 'idle') {
-              settleThenRestart()
-              return
-            }
-            restartNow('idle')
-          }, RESTART_DELIVERY_SETTLE_MS)
-        },
-        () => {
-          if (!settled) restartNow('idle-failed')
-        },
-      )
+      settleTimer = setTimeout(() => {
+        if (!settled) restartNow('idle')
+      }, RESTART_DELIVERY_SETTLE_MS)
     }
     settleThenRestart()
-    // 兜底: 用户持续发消息时 whenIdle 不会收敛, 到点强制重启。
+    // 兜底: 当前轮长时间不结束(死循环/超长任务)时, 到点强制重启。
     timer = setTimeout(() => restartNow('timeout'), Math.max(6000, Math.floor(maxWaitMs)))
   }
 

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { hasUserPending, needsResume } from '../lib/restart-idle.js'
+import { drainQueuedMessages, hasUserPending, needsResume } from '../lib/restart-idle.js'
 
 test('only a session whose turn is still running is resumed', () => {
   // 轮还在跑 → 重启后注入继续提示。
@@ -19,4 +19,36 @@ test('queued user input suppresses the continuation prompt', () => {
   assert.equal(hasUserPending(userPending), true)
   assert.equal(hasUserPending(pluginOnly), false)
   assert.equal(hasUserPending(empty), false)
+})
+test('drains both inbox queues in next-step → next-turn order', () => {
+  const state = {
+    nextStep: [{ id: 'step-1' }],
+    nextTurn: [{ id: 'turn-1' }, { id: 'turn-2' }],
+  }
+  const inbox = {
+    get nextStep() { return state.nextStep },
+    get nextTurn() { return state.nextTurn },
+    splice(target, start, deleteCount, inserted) {
+      const list = target === 'next-step' ? state.nextStep : state.nextTurn
+      return list.splice(start, deleteCount, ...inserted)
+    },
+  }
+
+  // turn/end 后宿主会立刻 claim 排队消息开下一轮 —— 必须一次清空两个队列, 顺序为 next-step → next-turn。
+  assert.deepEqual(drainQueuedMessages(inbox), [{ id: 'step-1' }, { id: 'turn-1' }, { id: 'turn-2' }])
+  assert.deepEqual(state.nextStep, [])
+  assert.deepEqual(state.nextTurn, [])
+})
+
+test('drainQueuedMessages is a no-op for empty queues', () => {
+  const state = { nextStep: [], nextTurn: [] }
+  const inbox = {
+    get nextStep() { return state.nextStep },
+    get nextTurn() { return state.nextTurn },
+    splice(target, start, deleteCount, inserted) {
+      const list = target === 'next-step' ? state.nextStep : state.nextTurn
+      return list.splice(start, deleteCount, ...inserted)
+    },
+  }
+  assert.deepEqual(drainQueuedMessages(inbox), [])
 })

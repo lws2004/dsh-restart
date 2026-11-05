@@ -39,3 +39,21 @@ export interface RestartInboxAgent {
  * @returns 队列里存在真实用户输入时为 true。
  */
 export declare function hasUserPending(agent: RestartInboxAgent): boolean;
+/** inbox 中可被扣下的两个队列(与宿主 Agent['inbox'] 对齐的最小接口)。 */
+export interface RestartInboxDrain {
+    readonly nextTurn: readonly unknown[];
+    readonly nextStep: readonly unknown[];
+    splice(target: 'next-turn' | 'next-step', start: number, deleteCount: number, inserted: unknown[]): unknown[];
+}
+/**
+ * 扣下 inbox 中所有尚未开跑的排队消息, 保持 next-step → next-turn 的顺序。
+ *
+ * 重启排程的 fire 发生在 turn/end 的同步监听器里。此刻若不清理 inbox, 宿主 agent-loop
+ * 会在 turn/end 之后立刻看到「inbox.hasPending」并开下一轮, 把重启推迟到那一轮结束 ——
+ * 2026-11-05 实测就是被一条排队消息拖了 4 分钟。清空后本轮结束即无后续轮次, 消息由调用方
+ * 落盘并在重启后重放。
+ *
+ * @param inbox - 宿主 Agent 的 inbox。
+ * @returns 按原队列顺序扣下的消息。
+ */
+export declare function drainQueuedMessages(inbox: RestartInboxDrain): unknown[];
